@@ -56,3 +56,13 @@ export interface PatrolGap {
 export function patrolLabel(patrol: Patrol, stationName: string): string {
   return `${stationName} · 计划 ${patrol.planDate}`
 }
+
+/**
+ * 读数判定的基准日期：已完成按实际巡检日期，未完成按计划日期。
+ * 未完成的计划不会提前套用未来生效的新标准。
+ */
+export function patrolBaseDate(patrol: Pick<Patrol, 'patrolDate' | 'planDate'> | null | undefined): string {
+  const fallback = new Date().toISOString().slice(0, 10)
+  if (!patrol) return fallback
+  return patrol.patrolDate || patrol.planDate || fallback
+}

@@ -175,9 +175,25 @@ export default function AbnormalBoard() {
     },
     {
       title: '标准区间',
-      width: 180,
-      render: (_value, record) =>
-        record.point ? `${record.point.standardMin} ~ ${record.point.standardMax} ${record.point.unit}` : '—'
+      width: 210,
+      render: (_value, record) => {
+        if (!record.point) return '—'
+        const version = record.version
+        const min = version ? version.standardMin : record.point.standardMin
+        const max = version ? version.standardMax : record.point.standardMax
+        return (
+          <Space size={4}>
+            <span>
+              {min} ~ {max} {record.point.unit}
+            </span>
+            {version ? (
+              <Tag size="small" color="blue" title={`自 ${version.effectiveDate} 起生效`}>
+                v{version.version}
+              </Tag>
+            ) : null}
+          </Space>
+        )
+      }
     },
     {
       title: '读数',
@@ -203,7 +219,7 @@ export default function AbnormalBoard() {
     {
       title: '巡检日期',
       width: 120,
-      render: (_value, record) => record.patrol?.planDate ?? '—'
+      render: (_value, record) => (record.patrol ? record.patrol.patrolDate || record.patrol.planDate : '—')
     },
     {
       title: '备注',
@@ -240,7 +256,8 @@ export default function AbnormalBoard() {
         <div>
           <h2 className="page-head__title">异常判定与分级</h2>
           <p className="page-head__desc">
-            关键点偏差率 &gt; {CRITICAL_DEVIATION_PCT}%、普通点 &gt; {SEVERE_DEVIATION_PCT}% 判严重超标；按权重降序排列。
+            关键点偏差率 &gt; {CRITICAL_DEVIATION_PCT}%、普通点 &gt; {SEVERE_DEVIATION_PCT}% 判严重超标；
+            判定按读数巡检日期匹配的标准版本执行，改值不回溯历史。
           </p>
         </div>
         <div className="page-head__actions">

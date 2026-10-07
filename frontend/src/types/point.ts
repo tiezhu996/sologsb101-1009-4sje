@@ -58,6 +58,27 @@ export interface StandardDraft {
   isCritical: boolean
 }
 
+/**
+ * 点位标准值版本：按生效日期启用，历史版本全部保留。
+ * 同一生效日期重复提交只覆盖该版本（最后一次提交为准），不新增版本号，
+ * 避免同次巡检前后保存命中不同版本而出现两种异常级别。
+ */
+export interface StandardVersion {
+  id: string
+  pointId: string
+  /** 版本号，从 1 开始递增 */
+  version: number
+  /** 生效日期 YYYY-MM-DD；读数按实际巡检日期匹配生效版本 */
+  effectiveDate: string
+  standardMin: number
+  standardMax: number
+  isCritical: boolean
+  /** 调整原因（季节切换 / 检修后调整等） */
+  reason: string
+  createdAt: number
+  updatedAt: number
+}
+
 /** 点位筛选条件（存于 patrolStore 之外的组合条件） */
 export interface PointFilterState {
   keyword: string

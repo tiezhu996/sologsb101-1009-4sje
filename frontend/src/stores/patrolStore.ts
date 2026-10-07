@@ -4,19 +4,30 @@
  */
 import { create } from 'zustand'
 import { liveQuery } from 'dexie'
-import { createId, db, deletePatrolCascade, putReading, type PatrolRow, type ReadingRow } from '@/utils/db'
+import {
+  createId,
+  db,
+  deletePatrolCascade,
+  putReading,
+  recalculateReadingsOfPatrol,
+  type PatrolRow,
+  type ReadingRow
+} from '@/utils/db'
 import type { Patrol, PatrolDraft, PatrolState } from '@/types/patrol'
-import type { Point } from '@/types/point'
+import { patrolBaseDate } from '@/types/patrol'
+import type { Point, StandardVersion } from '@/types/point'
 import type { Reading } from '@/types/reading'
 import type { ReadingDraftMap } from '@/types/reading'
 import type { AbnormalLevel, ReadingJudgement } from '@/utils/range'
-import { abnormalLevelOf, abnormalWeight, judgeReading } from '@/utils/range'
+import { abnormalLevelOf, abnormalWeight, judgeReading, resolveStandardVersion } from '@/utils/range'
 import { useStationStore } from '@/stores/stationStore'
 
 export interface AbnormalRow {
   reading: Reading
   patrol: Patrol | null
   point: Point | null
+  /** 读数判定所用的标准版本（旧数据可能缺失） */
+  version: StandardVersion | null
   level: AbnormalLevel
   weight: number
 }
@@ -45,7 +56,8 @@ interface PatrolState_ {
   saveReadingDrafts: (patrolId: string, points: Point[]) => Promise<number>
   saveSingleReading: (patrolId: string, point: Point, value: number, note: string) => Promise<void>
   removeReading: (id: string) => Promise<void>
-  judge: (point: Point, value: number) => ReadingJudgement
+  /** 实时判定：按基准日期（实际巡检日期，未执行为计划日期）匹配标准版本 */
+  judge: (point: Point, value: number, date?: string) => ReadingJudgement
   readingsOfPatrol: (patrolId: string) => Reading[]
   abnormalRows: () => AbnormalRow[]
   filteredPatrols: () => Patrol[]
@@ -99,6 +111,10 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
     if (patch.patrolman !== undefined) next.patrolman = patch.patrolman.trim()
     if (patch.envNote !== undefined) next.envNote = patch.envNote.trim()
     await db.patrols.update(id, next)
+    // 基准日期变化会影响读数命中的标准版本，需按版本重算该次巡检读数
+    if (patch.patrolDate !== undefined || patch.planDate !== undefined) {
+      await recalculateReadingsOfPatrol(id)
+    }
   },
 
   async removePatrol(id) {
@@ -139,6 +155,8 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
       envNote: envNote.trim(),
       updatedAt: Date.now()
     })
+    // 实际巡检日期确定后，按该日期匹配的标准版本重算本次读数
+    await recalculateReadingsOfPatrol(id)
   },
 
   setReadingDraft(patrolId, pointId, value) {
@@ -172,6 +190,9 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
   async saveReadingDrafts(patrolId, points) {
     const draft = get().readingDraft
     const existing = get().readings.filter((reading) => reading.patrolId === patrolId)
+    const patrol = get().patrols.find((item) => item.id === patrolId) ?? null
+    const baseDate = patrolBaseDate(patrol)
+    const versions = useStationStore.getState().standardVersions
     const now = Date.now()
     const payload: ReadingRow[] = []
     points.forEach((point) => {
@@ -179,7 +200,10 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
       const value = draft[key]
       if (value === undefined || !Number.isFinite(value)) return
       const found = existing.find((reading) => reading.pointId === point.id)
-      const judgement = judgeReading(value, point.standardMin, point.standardMax, point.isCritical)
+      const version = resolveStandardVersion(versions, point.id, baseDate)
+      const judgement = version
+        ? judgeReading(value, version.standardMin, version.standardMax, version.isCritical)
+        : judgeReading(value, point.standardMin, point.standardMax, point.isCritical)
       payload.push({
         id: found ? found.id : createId('rd'),
         patrolId,
@@ -187,6 +211,7 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
         value,
         isAbnormal: judgement.isAbnormal,
         deviationPct: judgement.deviationPct,
+        standardVersionId: version ? version.id : found ? found.standardVersionId : '',
         note: found ? found.note : '',
         createdAt: found ? found.createdAt : now,
         updatedAt: now
@@ -214,7 +239,10 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
     await db.readings.delete(id)
   },
 
-  judge(point, value) {
+  judge(point, value, date) {
+    const baseDate = date ?? new Date().toISOString().slice(0, 10)
+    const version = resolveStandardVersion(useStationStore.getState().standardVersions, point.id, baseDate)
+    if (version) return judgeReading(value, version.standardMin, version.standardMax, version.isCritical)
     return judgeReading(value, point.standardMin, point.standardMax, point.isCritical)
   },
 
@@ -224,20 +252,25 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
 
   abnormalRows() {
     const points = useStationStore.getState().points
+    const versions = useStationStore.getState().standardVersions
     return get()
       .readings.filter((reading) => reading.isAbnormal)
       .map((reading) => {
         const point = points.find((item) => item.id === reading.pointId) ?? null
         const patrol = get().patrols.find((item) => item.id === reading.patrolId) ?? null
-        const level: AbnormalLevel = point
-          ? abnormalLevelOf(reading.deviationPct, point.isCritical)
-          : '轻微超标'
+        // 优先取读数落库时记录的版本；缺失时按巡检基准日期重新匹配
+        const version =
+          versions.find((item) => item.id === reading.standardVersionId) ??
+          (point ? resolveStandardVersion(versions, point.id, patrolBaseDate(patrol)) : null)
+        const critical = version ? version.isCritical : point ? point.isCritical : false
+        const level: AbnormalLevel = abnormalLevelOf(reading.deviationPct, critical)
         return {
           reading,
           patrol,
           point,
+          version,
           level,
-          weight: point ? abnormalWeight(level, point.isCritical) : 20
+          weight: abnormalWeight(level, critical)
         }
       })
       .sort((a, b) => b.weight - a.weight || b.reading.deviationPct - a.reading.deviationPct)

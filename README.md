@@ -70,18 +70,21 @@ sologsb101-1009/
 | 路由 | 页面 | 消费模型 | 主要交互 |
 | --- | --- | --- | --- |
 | `/stations` | 调压站与设备台账 | Station、Device | 新建/编辑/删除站点与设备；按压力等级与设备类型筛选；卡片回显设备数、待处置泄漏数与漏检次数 |
-| `/points` | 巡检点位与标准值配置 | Point、Device | 维护点位上下限/单位/关键点标记（草稿 → 逐条/批量提交并重算历史读数）；按模板批量复制标准值 |
-| `/patrols` | 巡检录入 | Patrol、Reading、Point | 选定任务后逐点录入读数，实时偏差率与异常级别；逐点或整批保存；完成巡检、标记漏检、现场备注 |
-| `/abnormal` | 异常判定与分级 | Reading、Point | 按关键点权重降序排列；勾选批量确认；浓度类点位一键派发泄漏处置单 |
+| `/points` | 巡检点位与标准值配置 | Point、Device、StandardVersion | 维护点位上下限/单位/关键点标记（草稿 → 按生效日期提交为标准版本，同一生效日期重复提交覆盖该版本）；查看版本历史；按模板批量复制标准值 |
+| `/patrols` | 巡检录入 | Patrol、Reading、Point、StandardVersion | 选定任务后逐点录入读数，按实际巡检日期匹配标准版本实时判定；逐点或整批保存；完成巡检、标记漏检、现场备注 |
+| `/abnormal` | 异常判定与分级 | Reading、Point、StandardVersion | 按读数所用标准版本分级排序；勾选批量确认；浓度类点位一键派发泄漏处置单 |
 | `/leaks` | 泄漏处置单与复检闭环 | Leak、Device、Reading | 派单 → 填写处置措施与处置人 → 录入复检浓度判合格闭环；导出处置台账 CSV |
-| `/plans` | 巡检计划与漏检提醒 | Patrol、Station | 按站点批量生成计划；超期未检自动提醒并按超期天数排序；导出读数台账 CSV 与结构版本 |
+| `/plans` | 巡检计划与漏检提醒 | Patrol、Station | 按站点批量生成计划；超期未检自动提醒并按超期天数排序；导出读数台账 CSV（含所用标准版本）与结构版本 |
 
 ## 五、数据存储说明
 
 - **IndexedDB 库名**：`gbgaspress`（Dexie 封装，`src/utils/db.ts`）
-- **对象表**：`stations`、`devices`、`points`、`patrols`、`readings`、`leaks`
-- **数据结构版本**：`DB_VERSION = 2`，含 `version(1)` → `version(2)` 的索引变更与 `upgrade()` 迁移（补齐 `revision`、用所属设备回填点位与处置单的 `stationId` 冗余列、按标准区间重算历史读数 `deviationPct` / `isAbnormal`）
-- **首屏自动播种**：`initDatabase()` 中 `if (await db.stations.count() === 0) await seedDatabase()`，播种 2 座调压站 → 5 台设备 → 11 个点位 → 6 次巡检 → 11 条读数 → 3 张泄漏处置单的完整父子孙链条；播种幂等
+- **对象表**：`stations`、`devices`、`points`、`patrols`、`readings`、`leaks`、`standardVersions`
+- **数据结构版本**：`DB_VERSION = 3`，含 `version(1)` → `version(2)` → `version(3)` 的索引变更与 `upgrade()` 迁移：
+  - v2：补齐 `revision`、用所属设备回填点位与处置单的 `stationId` 冗余列、按标准区间重算历史读数
+  - v3：新增 `standardVersions` 标准版本表；既有标准逐点位补为 `v1`（生效日期取点位创建日）；读数回填 `standardVersionId` 并按 v1 重算（判定结果与迁移前一致）
+- **标准值版本化**：点位标准值按「版本号 + 生效日期」管理，改值自生效日起启用；同一生效日期重复提交以最后一次为准覆盖该版本（不新增版本号），不同生效日期新增版本且历史版本全部保留；点位上的 `standardMin/Max/isCritical` 冗余为「截至今天已生效的最新版本」
+- **首屏自动播种**：`initDatabase()` 中 `if (await db.stations.count() === 0) await seedDatabase()`，播种 2 座调压站 → 5 台设备 → 11 个点位（各含 v1 标准版本）→ 6 次巡检 → 11 条读数 → 3 张泄漏处置单的完整父子孙链条；播种幂等
 - **localStorage 辅助键**：`gbgaspress:db-version`、`gbgaspress:last-backup-at`、`gbgaspress:ui-prefs`
 - 应用为**无状态容器**：数据不落容器磁盘、不使用数据库服务、不挂载命名卷
 
@@ -100,5 +103,6 @@ npm run preview    # 本地预览构建产物
 - 偏差率：读数落在标准区间内为 `0`；越限时按越限幅度相对边界值计算百分比
 - 分级：关键点偏差率 `> 5%`、普通点 `> 10%` 判「严重超标」，否则「轻微超标」，区间内为「正常」
 - 排序权重：严重超标（关键点 50 / 普通点 30）> 轻微超标（关键点 30 / 普通点 20）> 正常（0）
+- **版本匹配**：读数判定取「实际巡检日期（未执行为计划日期）≤ 版本生效日期」的最新标准版本；未完成的计划不提前套用未来生效的新标准；完成/改期巡检时按新实际日期重算该次读数；读数落库记录 `standardVersionId`，可在巡检录入页、异常分级页与导出 CSV 中查询所用版本
 - 泄漏复检合格阈值：`≤ 50 ppm`
 - 漏检判定：计划日期早于今天且实际日期为空

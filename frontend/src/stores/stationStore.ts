@@ -6,22 +6,24 @@
 import { create } from 'zustand'
 import { liveQuery } from 'dexie'
 import {
+  commitStandardVersion,
   createId,
   db,
   deleteDeviceCascade,
   deletePointCascade,
   deleteStationCascade,
+  localDateOf,
   readUiPrefs,
-  recalculateReadingsOfPoint,
   writeUiPrefs,
   type DeviceRow,
   type PointRow,
   type StationRow
 } from '@/utils/db'
 import type { Device, DeviceDraft, DeviceState, DeviceType } from '@/types/device'
-import type { Point, PointDraft, PointFilterState, PointTemplate, StandardDraft } from '@/types/point'
+import type { Point, PointDraft, PointFilterState, PointTemplate, StandardDraft, StandardVersion } from '@/types/point'
 import { createEmptyPointFilter } from '@/types/point'
 import type { Station, StationDraft, StationGrade } from '@/types/station'
+import { resolveStandardVersion } from '@/utils/range'
 
 export interface StationFilterState {
   keyword: string
@@ -37,6 +39,8 @@ interface StationState {
   stations: Station[]
   devices: Device[]
   points: Point[]
+  /** 全部点位的标准值版本（含历史版本） */
+  standardVersions: StandardVersion[]
   currentStationId: string | null
   filter: StationFilterState
   pointFilter: PointFilterState
@@ -60,10 +64,25 @@ interface StationState {
   applyTemplate: (deviceId: string, templates: PointTemplate[]) => Promise<number>
   setStandardDraft: (pointId: string, draft: StandardDraft) => void
   clearStandardDraft: (pointId?: string) => void
-  commitStandardDraft: (pointId: string) => Promise<void>
-  commitAllStandardDrafts: () => Promise<number>
+  /** 提交标准值：同一生效日期覆盖该版本，不同生效日期新增版本 */
+  commitStandardValues: (
+    pointId: string,
+    values: StandardDraft,
+    effectiveDate: string,
+    reason: string
+  ) => Promise<{ row: StandardVersion; overwritten: boolean }>
+  commitStandardDraft: (
+    pointId: string,
+    effectiveDate: string,
+    reason: string
+  ) => Promise<{ row: StandardVersion; overwritten: boolean } | null>
+  commitAllStandardDrafts: (effectiveDate: string, reason: string) => Promise<{ count: number; overwritten: number }>
   devicesOfStation: (stationId: string) => Device[]
   pointsOfDevice: (deviceId: string) => Point[]
+  /** 点位全部标准版本，按版本号降序 */
+  versionsOfPoint: (pointId: string) => StandardVersion[]
+  /** 截至今天已生效的当前版本 */
+  currentVersionOf: (pointId: string) => StandardVersion | null
   currentStation: () => Station | null
   filteredStations: () => Station[]
   pointStats: () => { total: number; critical: number }
@@ -73,6 +92,7 @@ export const useStationStore = create<StationState>((set, get) => ({
   stations: [],
   devices: [],
   points: [],
+  standardVersions: [],
   currentStationId: readUiPrefs().lastStationId,
   filter: createEmptyStationFilter(),
   pointFilter: createEmptyPointFilter(),
@@ -177,18 +197,30 @@ export const useStationStore = create<StationState>((set, get) => ({
       updatedAt: now
     }
     await db.points.put(row)
+    // 初始标准记为 v1，自创建日起生效
+    await commitStandardVersion({
+      pointId: row.id,
+      standardMin: row.standardMin,
+      standardMax: row.standardMax,
+      isCritical: row.isCritical,
+      effectiveDate: localDateOf(now),
+      reason: '初始标准'
+    })
     return row
   },
 
   async updatePoint(id, patch) {
+    // 名称/单位/所属设备等档案字段直接更新；标准值变更必须走 commitStandardValues 版本化提交
     const next: Partial<PointRow> = { ...patch, updatedAt: Date.now() }
+    delete next.standardMin
+    delete next.standardMax
+    delete next.isCritical
     if (patch.name !== undefined) next.name = patch.name.trim()
     if (patch.deviceId !== undefined) {
       const device = await db.devices.get(patch.deviceId)
       if (device) next.stationId = device.stationId
     }
     await db.points.update(id, next)
-    await recalculateReadingsOfPoint(id)
   },
 
   async removePoint(id) {
@@ -215,7 +247,20 @@ export const useStationStore = create<StationState>((set, get) => ({
         createdAt: now,
         updatedAt: now
       }))
-    if (rows.length > 0) await db.points.bulkPut(rows)
+    if (rows.length > 0) {
+      await db.points.bulkPut(rows)
+      // 模板复制的点位同样以初始标准建立 v1 版本
+      for (const row of rows) {
+        await commitStandardVersion({
+          pointId: row.id,
+          standardMin: row.standardMin,
+          standardMax: row.standardMax,
+          isCritical: row.isCritical,
+          effectiveDate: localDateOf(now),
+          reason: '初始标准'
+        })
+      }
+    }
     return rows.length
   },
 
@@ -233,44 +278,37 @@ export const useStationStore = create<StationState>((set, get) => ({
     set({ standardDraft: next })
   },
 
-  async commitStandardDraft(pointId) {
-    const draft = get().standardDraft[pointId]
-    if (!draft) return
-    const min = Math.min(draft.standardMin, draft.standardMax)
-    const max = Math.max(draft.standardMin, draft.standardMax)
-    await db.points.update(pointId, {
+  async commitStandardValues(pointId, values, effectiveDate, reason) {
+    const min = Math.min(values.standardMin, values.standardMax)
+    const max = Math.max(values.standardMin, values.standardMax)
+    return commitStandardVersion({
+      pointId,
       standardMin: min,
       standardMax: max > min ? max : min + 0.001,
-      isCritical: draft.isCritical,
-      updatedAt: Date.now()
+      isCritical: values.isCritical,
+      effectiveDate,
+      reason: reason.trim()
     })
-    get().clearStandardDraft(pointId)
-    await recalculateReadingsOfPoint(pointId)
   },
 
-  async commitAllStandardDrafts() {
+  async commitStandardDraft(pointId, effectiveDate, reason) {
+    const draft = get().standardDraft[pointId]
+    if (!draft) return null
+    const result = await get().commitStandardValues(pointId, draft, effectiveDate, reason)
+    get().clearStandardDraft(pointId)
+    return result
+  },
+
+  async commitAllStandardDrafts(effectiveDate, reason) {
     const entries = Object.entries(get().standardDraft)
-    if (entries.length === 0) return 0
-    const rows = get()
-      .points.filter((point) => entries.some(([id]) => id === point.id))
-      .map((point) => {
-        const draft = get().standardDraft[point.id]
-        const min = Math.min(draft.standardMin, draft.standardMax)
-        const max = Math.max(draft.standardMin, draft.standardMax)
-        return {
-          ...point,
-          standardMin: min,
-          standardMax: max > min ? max : min + 0.001,
-          isCritical: draft.isCritical,
-          updatedAt: Date.now()
-        }
-      })
-    if (rows.length > 0) await db.points.bulkPut(rows)
-    get().clearStandardDraft()
-    for (const row of rows) {
-      await recalculateReadingsOfPoint(row.id)
+    if (entries.length === 0) return { count: 0, overwritten: 0 }
+    let overwritten = 0
+    for (const [pointId, draft] of entries) {
+      const result = await get().commitStandardValues(pointId, draft, effectiveDate, reason)
+      if (result.overwritten) overwritten += 1
     }
-    return rows.length
+    get().clearStandardDraft()
+    return { count: entries.length, overwritten }
   },
 
   devicesOfStation(stationId) {
@@ -279,6 +317,16 @@ export const useStationStore = create<StationState>((set, get) => ({
 
   pointsOfDevice(deviceId) {
     return get().points.filter((point) => point.deviceId === deviceId)
+  },
+
+  versionsOfPoint(pointId) {
+    return get()
+      .standardVersions.filter((version) => version.pointId === pointId)
+      .sort((a, b) => b.version - a.version)
+  },
+
+  currentVersionOf(pointId) {
+    return resolveStandardVersion(get().standardVersions, pointId, localDateOf(Date.now()))
   },
 
   currentStation() {
@@ -320,6 +368,12 @@ liveQuery(async () =>
   (await db.points.toArray()).sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'))
 ).subscribe({
   next: (rows) => useStationStore.setState({ points: rows })
+})
+
+liveQuery(async () =>
+  (await db.standardVersions.toArray()).sort((a, b) => a.pointId.localeCompare(b.pointId) || b.version - a.version)
+).subscribe({
+  next: (rows) => useStationStore.setState({ standardVersions: rows })
 })
 
 export type { DeviceState, DeviceType }

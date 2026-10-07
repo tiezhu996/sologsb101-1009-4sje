@@ -27,6 +27,7 @@ import { usePatrolGap } from '@/hooks/usePatrolGap'
 import { PATROL_STATES, type Patrol, type PatrolState } from '@/types/patrol'
 import type { Point } from '@/types/point'
 import type { Reading } from '@/types/reading'
+import { abnormalLevelOf, resolveStandardVersion } from '@/utils/range'
 
 export default function PatrolEntry() {
   const stationStore = useStationStore()
@@ -79,6 +80,11 @@ export default function PatrolEntry() {
 
   const activeReadings = activePatrol ? patrolStore.readingsOfPatrol(activePatrol.id) : []
 
+  /** 判定基准日期：已完成按实际巡检日期，未完成按计划日期（不提前套用未来生效的新标准） */
+  const baseDate = activePatrol
+    ? activePatrol.patrolDate || activePatrol.planDate
+    : new Date().toISOString().slice(0, 10)
+
   useEffect(() => {
     if (activePatrol) patrolStore.seedDraftFromReadings(activePatrol.id, activePoints)
     // 仅在切换巡检任务或点位集合变化时回填草稿
@@ -87,7 +93,7 @@ export default function PatrolEntry() {
   const abnormalInDraft = activePoints.filter((point) => {
     const value = activePatrol ? patrolStore.readingDraft[`${activePatrol.id}:${point.id}`] : undefined
     if (value === undefined) return false
-    return patrolStore.judge(point, value).isAbnormal
+    return patrolStore.judge(point, value, baseDate).isAbnormal
   }).length
 
   const saveAll = async (): Promise<void> => {
@@ -155,6 +161,8 @@ export default function PatrolEntry() {
       width: 180,
       render: (_value, record) => {
         const point = stationStore.points.find((item) => item.id === record.pointId)
+        const version = stationStore.standardVersions.find((item) => item.id === record.standardVersionId)
+        if (version) return `${version.standardMin} ~ ${version.standardMax} ${point ? point.unit : ''}`
         return point ? `${point.standardMin} ~ ${point.standardMax} ${point.unit}` : '—'
       }
     },
@@ -166,7 +174,22 @@ export default function PatrolEntry() {
       render: (_value, record) => {
         const point = stationStore.points.find((item) => item.id === record.pointId)
         if (!point) return <Tag>—</Tag>
-        return <AbnormalTag level={patrolStore.judge(point, record.value).level} size="small" />
+        const version = stationStore.standardVersions.find((item) => item.id === record.standardVersionId)
+        const critical = version ? version.isCritical : point.isCritical
+        return <AbnormalTag level={abnormalLevelOf(record.deviationPct, critical)} size="small" />
+      }
+    },
+    {
+      title: '标准版本',
+      width: 150,
+      render: (_value, record) => {
+        const version = stationStore.standardVersions.find((item) => item.id === record.standardVersionId)
+        if (!version) return <span className="muted">—</span>
+        return (
+          <Tag size="small" color="blue" title={`自 ${version.effectiveDate} 起生效`}>
+            v{version.version} · {version.effectiveDate}
+          </Tag>
+        )
       }
     },
     { title: '备注', dataIndex: 'note', width: 200, render: (value: string) => value || '—' },
@@ -194,7 +217,7 @@ export default function PatrolEntry() {
         <div>
           <h2 className="page-head__title">巡检录入</h2>
           <p className="page-head__desc">
-            选定巡检任务后逐点录入读数，系统即时给出偏差率与异常级别；完成后可标记漏检或删除任务。
+            选定巡检任务后逐点录入读数，按实际巡检日期匹配的标准版本即时给出偏差率与异常级别；完成后可标记漏检或删除任务。
           </p>
         </div>
         <div className="page-head__actions">
@@ -322,21 +345,31 @@ export default function PatrolEntry() {
                   {activePoints.map((point) => {
                     const key = `${activePatrol.id}:${point.id}`
                     const value = patrolStore.readingDraft[key]
-                    const judgement = value === undefined ? null : patrolStore.judge(point, value)
+                    const judgement = value === undefined ? null : patrolStore.judge(point, value, baseDate)
                     const saved = activeReadings.find((item) => item.pointId === point.id)
+                    // 按基准日期匹配的标准版本：未完成计划不会提前套用未来生效的新标准
+                    const version = resolveStandardVersion(stationStore.standardVersions, point.id, baseDate)
+                    const min = version ? version.standardMin : point.standardMin
+                    const max = version ? version.standardMax : point.standardMax
+                    const critical = version ? version.isCritical : point.isCritical
                     return (
                       <div key={point.id} className="panel" style={{ padding: 12 }}>
                         <div className="card-list-item__head">
                           <span>
                             {point.name}
-                            {point.isCritical ? <Tag color="orange" size="small" style={{ marginLeft: 6 }}>关键点</Tag> : null}
+                            {critical ? <Tag color="orange" size="small" style={{ marginLeft: 6 }}>关键点</Tag> : null}
                           </span>
                           {judgement ? <AbnormalTag level={judgement.level} deviationPct={judgement.deviationPct} size="small" /> : null}
                         </div>
                         <div className="card-list-item__meta">
                           <span>
-                            标准 {point.standardMin} ~ {point.standardMax} {point.unit}
+                            标准 {min} ~ {max} {point.unit}
                           </span>
+                          {version ? (
+                            <Tag size="small" color="blue" title={`自 ${version.effectiveDate} 起生效`}>
+                              v{version.version}
+                            </Tag>
+                          ) : null}
                           {saved ? <span>· 已存档 {saved.value}</span> : null}
                         </div>
                         <Space style={{ marginTop: 8 }}>

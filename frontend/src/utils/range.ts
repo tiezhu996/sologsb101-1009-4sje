@@ -1,6 +1,8 @@
 /**
  * 标准区间判定、偏差率计算、ppm 与压力单位换算
  */
+import type { StandardVersion } from '@/types/point'
+
 export type AbnormalLevel = '正常' | '轻微超标' | '严重超标'
 
 /** 非关键点偏差率超过 10% 判严重超标 */
@@ -82,6 +84,24 @@ export interface ReadingJudgement {
   isAbnormal: boolean
   level: AbnormalLevel
   weight: number
+}
+
+/**
+ * 按日期匹配点位标准版本：取生效日期不晚于 date 的最新版本；
+ * 全部版本都晚于 date 时兜底取生效最早的版本；点位无版本返回 null。
+ */
+export function resolveStandardVersion(
+  versions: StandardVersion[],
+  pointId: string,
+  date: string
+): StandardVersion | null {
+  const list = versions.filter((item) => item.pointId === pointId)
+  if (list.length === 0) return null
+  const eligible = list
+    .filter((item) => item.effectiveDate <= date)
+    .sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate) || b.version - a.version)
+  if (eligible.length > 0) return eligible[0]
+  return [...list].sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate) || a.version - b.version)[0]
 }
 
 export function judgeReading(value: number, min: number, max: number, isCritical: boolean): ReadingJudgement {

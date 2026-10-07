@@ -7,6 +7,8 @@ export interface Reading {
   isAbnormal: boolean
   /** 偏差率（%），区间内为 0 */
   deviationPct: number
+  /** 判定所用标准版本 id；空串表示未匹配到版本（按点位当前标准判定） */
+  standardVersionId: string
   note: string
   createdAt: number
   updatedAt: number
