@@ -1,6 +1,7 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据结构版本号 + upgrade 迁移
+ * - 标准值版本化：改值按生效日期生成新版本，读数按实际巡检日期匹配版本判定
  * - 级联删除、整库导入导出、首屏幂等播种
  */
 import Dexie, { type Table } from 'dexie'
@@ -10,10 +11,12 @@ import type { Point } from '@/types/point'
 import type { Patrol } from '@/types/patrol'
 import type { Reading } from '@/types/reading'
 import type { Leak } from '@/types/leak'
-import { deviationPctOf, judgeReading } from '@/utils/range'
+import type { StandardVersion } from '@/types/standard'
+import { matchStandardVersion } from '@/types/standard'
+import { dateTextOf, deviationPctOf, judgeReading, todayText } from '@/utils/range'
 
 export const DB_NAME = 'gbgaspress'
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export const LS_KEYS = {
   dbVersion: 'gbgaspress:db-version',
@@ -38,13 +41,14 @@ export interface BackupPayload {
   patrols: Patrol[]
   readings: Reading[]
   leaks: Leak[]
+  standardVersions: StandardVersion[]
 }
 
 export interface Revisioned {
   revision?: number
 }
 
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 export type StationRow = Station & Revisioned
 export type DeviceRow = Device & Revisioned
@@ -52,6 +56,7 @@ export type PointRow = Point & Revisioned
 export type PatrolRow = Patrol & Revisioned
 export type ReadingRow = Reading & Revisioned
 export type LeakRow = Leak & Revisioned
+export type StandardVersionRow = StandardVersion & Revisioned
 
 class GasPressDatabase extends Dexie {
   stations!: Table<StationRow, string>
@@ -60,6 +65,7 @@ class GasPressDatabase extends Dexie {
   patrols!: Table<PatrolRow, string>
   readings!: Table<ReadingRow, string>
   leaks!: Table<LeakRow, string>
+  standardVersions!: Table<StandardVersionRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -147,6 +153,63 @@ class GasPressDatabase extends Dexie {
             }
           })
       })
+
+    // v3：标准值版本化——新增 standardVersions 表；现有标准补成第一版；读数回写所用版本 id
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, grade, updatedAt',
+        devices: 'id, stationId, type, state, updatedAt',
+        points: 'id, deviceId, stationId, name, isCritical, updatedAt',
+        patrols: 'id, stationId, planDate, state, updatedAt',
+        readings: 'id, patrolId, pointId, isAbnormal, standardVersionId, updatedAt',
+        leaks: 'id, deviceId, stationId, state, handler, updatedAt',
+        standardVersions: 'id, pointId, effectiveDate, version, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        for (const name of ['stations', 'devices', 'points', 'patrols', 'readings', 'leaks', 'standardVersions']) {
+          await tx
+            .table(name)
+            .toCollection()
+            .modify((row: Record<string, unknown>) => {
+              row.revision = ROW_REVISION
+            })
+        }
+
+        // 迁移：每个点位的现行标准补成第一版，生效日期取点位创建日
+        const points = (await tx.table('points').toArray()) as Array<{
+          id: string
+          standardMin: number
+          standardMax: number
+          isCritical: boolean
+          createdAt: number
+          updatedAt: number
+        }>
+        const now = Date.now()
+        const firstVersions = points.map((point) => ({
+          id: createId('sv'),
+          pointId: point.id,
+          version: 1,
+          standardMin: point.standardMin,
+          standardMax: point.standardMax,
+          isCritical: point.isCritical === true,
+          effectiveDate: dateTextOf(point.createdAt),
+          createdAt: Number.isFinite(point.createdAt) ? point.createdAt : now,
+          updatedAt: now,
+          revision: ROW_REVISION
+        }))
+        if (firstVersions.length > 0) await tx.table('standardVersions').bulkPut(firstVersions)
+        const versionOfPoint = new Map(firstVersions.map((row) => [row.pointId, row.id]))
+
+        // 迁移：读数回写判定所用标准版本（此前只有一版，全部归属 v1）
+        await tx
+          .table('readings')
+          .toCollection()
+          .modify((reading: Record<string, unknown>) => {
+            if (typeof reading.standardVersionId !== 'string' || reading.standardVersionId.length === 0) {
+              reading.standardVersionId = versionOfPoint.get(String(reading.pointId)) ?? ''
+            }
+          })
+      })
   }
 }
 
@@ -189,8 +252,21 @@ const SEED_POINTS: PointRow[] = [
   { id: 'pt-11', deviceId: 'dv-5', stationId: 'st-2', name: '放散压力', standardMin: 0.18, standardMax: 0.3, unit: 'MPa', isCritical: true, createdAt: stamp(-259), updatedAt: stamp(-1), revision: ROW_REVISION }
 ]
 
-const SEED_PATROLS: PatrolRow[] = [
-  { id: 'pa-1', stationId: 'st-1', planDate: '2024-06-05', patrolDate: '2024-06-05', patrolman: '张伟', envNote: '晴，气温 26℃', state: '已完成', createdAt: stamp(-15), updatedAt: stamp(-15), revision: ROW_REVISION },
+/** 播种：现有标准补成第一版（v1），生效日期取点位创建日 */
+const SEED_STANDARD_VERSIONS: StandardVersionRow[] = SEED_POINTS.map((point, index) => ({
+  id: `sv-${index + 1}`,
+  pointId: point.id,
+  version: 1,
+  standardMin: point.standardMin,
+  standardMax: point.standardMax,
+  isCritical: point.isCritical,
+  effectiveDate: dateTextOf(point.createdAt),
+  createdAt: point.createdAt,
+  updatedAt: point.updatedAt,
+  revision: ROW_REVISION
+}))
+
+const SEED_PATROLS: PatrolRow[] = [  { id: 'pa-1', stationId: 'st-1', planDate: '2024-06-05', patrolDate: '2024-06-05', patrolman: '张伟', envNote: '晴，气温 26℃', state: '已完成', createdAt: stamp(-15), updatedAt: stamp(-15), revision: ROW_REVISION },
   { id: 'pa-2', stationId: 'st-1', planDate: '2024-06-12', patrolDate: '2024-06-12', patrolman: '张伟', envNote: '多云，风力 3 级', state: '已完成', createdAt: stamp(-8), updatedAt: stamp(-8), revision: ROW_REVISION },
   { id: 'pa-3', stationId: 'st-1', planDate: '2024-06-19', patrolDate: '', patrolman: '', envNote: '', state: '待巡检', createdAt: stamp(-1), updatedAt: stamp(-1), revision: ROW_REVISION },
   { id: 'pa-4', stationId: 'st-2', planDate: '2024-06-06', patrolDate: '2024-06-08', patrolman: '李娜', envNote: '中雨，到场延迟 2 天', state: '已完成', createdAt: stamp(-14), updatedAt: stamp(-12), revision: ROW_REVISION },
@@ -219,10 +295,11 @@ const SEED_LEAKS: LeakRow[] = [
   { id: 'lk-3', deviceId: 'dv-4', stationId: 'st-2', concentrationPpm: 88, foundTime: '2024-06-08', measure: '', state: '待处置', retestValuePpm: 0, handler: '', createdAt: stamp(-12), updatedAt: stamp(-12), revision: ROW_REVISION }
 ]
 
-/** 由原始行派生偏差率与异常标记 */
+/** 由原始行派生偏差率与异常标记，并挂上判定所用标准版本 */
 function buildSeedReadings(): ReadingRow[] {
   return SEED_READING_ROWS.map(([patrolId, pointId, value, note], index) => {
     const point = SEED_POINTS.find((item) => item.id === pointId)
+    const version = SEED_STANDARD_VERSIONS.find((item) => item.pointId === pointId)
     const judgement = point
       ? judgeReading(value, point.standardMin, point.standardMax, point.isCritical)
       : { isAbnormal: false, deviationPct: deviationPctOf(value, 0, 1) }
@@ -233,6 +310,7 @@ function buildSeedReadings(): ReadingRow[] {
       value,
       isAbnormal: judgement.isAbnormal,
       deviationPct: judgement.deviationPct,
+      standardVersionId: version ? version.id : '',
       note,
       createdAt: stamp(-200 + index),
       updatedAt: stamp(-200 + index),
@@ -244,7 +322,7 @@ function buildSeedReadings(): ReadingRow[] {
 export async function seedDatabase(): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.standardVersions],
       async () => {
     await db.stations.bulkPut(SEED_STATIONS)
     await db.devices.bulkPut(SEED_DEVICES)
@@ -252,6 +330,7 @@ export async function seedDatabase(): Promise<void> {
     await db.patrols.bulkPut(SEED_PATROLS)
     await db.readings.bulkPut(buildSeedReadings())
     await db.leaks.bulkPut(SEED_LEAKS)
+    await db.standardVersions.bulkPut(SEED_STANDARD_VERSIONS)
   })
 }
 
@@ -268,7 +347,7 @@ export async function initDatabase(): Promise<void> {
 export async function deleteStationCascade(stationId: string): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.standardVersions],
       async () => {
     const devices = await db.devices.where('stationId').equals(stationId).toArray()
     await deleteDevicesInternal(devices.map((device) => device.id))
@@ -281,7 +360,7 @@ export async function deleteStationCascade(stationId: string): Promise<void> {
 export async function deleteDeviceCascade(deviceId: string): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.standardVersions],
       async () => {
     await deleteDevicesInternal([deviceId])
     await db.devices.delete(deviceId)
@@ -291,9 +370,10 @@ export async function deleteDeviceCascade(deviceId: string): Promise<void> {
 export async function deletePointCascade(pointId: string): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.standardVersions],
       async () => {
     await db.readings.where('pointId').equals(pointId).delete()
+    await db.standardVersions.where('pointId').equals(pointId).delete()
     await db.points.delete(pointId)
   })
 }
@@ -301,7 +381,7 @@ export async function deletePointCascade(pointId: string): Promise<void> {
 export async function deletePatrolCascade(patrolId: string): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.standardVersions],
       async () => {
     await db.readings.where('patrolId').equals(patrolId).delete()
     await db.patrols.delete(patrolId)
@@ -310,77 +390,195 @@ export async function deletePatrolCascade(patrolId: string): Promise<void> {
 
 async function deleteDevicesInternal(deviceIds: string[]): Promise<void> {
   if (deviceIds.length === 0) return
-  await db.points.where('deviceId').anyOf(deviceIds).delete()
+  const points = await db.points.where('deviceId').anyOf(deviceIds).toArray()
+  const pointIds = points.map((point) => point.id)
+  if (pointIds.length > 0) {
+    await db.standardVersions.where('pointId').anyOf(pointIds).delete()
+    await db.points.bulkDelete(pointIds)
+  }
   await db.leaks.where('deviceId').anyOf(deviceIds).delete()
+}
+
+/* ============================ 标准版本 ============================ */
+
+export interface StandardCommitPayload {
+  standardMin: number
+  standardMax: number
+  isCritical: boolean
+  /** 生效日期 YYYY-MM-DD */
+  effectiveDate: string
+}
+
+/** 取某点位全部标准版本（按版本号升序） */
+export async function listStandardVersions(pointId: string): Promise<StandardVersionRow[]> {
+  const rows = await db.standardVersions.where('pointId').equals(pointId).toArray()
+  return rows.sort((a, b) => a.version - b.version)
+}
+
+/**
+ * 提交标准值变更：
+ * - 同一生效日期已存在版本时按最后一次提交覆盖（不新增版本），保证同次巡检前后判定一致
+ * - 否则生成新版本，自生效日期起启用
+ * - 点位行镜像最新版本号的标准值，供配置页展示当前标准
+ * 注意：不回算历史读数与已派发处置单的判据。
+ */
+export async function commitStandardVersion(
+  pointId: string,
+  payload: StandardCommitPayload
+): Promise<StandardVersionRow> {
+  return db.transaction('rw', [db.standardVersions, db.points], async () => {
+    const now = Date.now()
+    const versions = await db.standardVersions.where('pointId').equals(pointId).toArray()
+    const sameDay = versions.find((version) => version.effectiveDate === payload.effectiveDate)
+    let saved: StandardVersionRow
+    if (sameDay) {
+      saved = {
+        ...sameDay,
+        standardMin: payload.standardMin,
+        standardMax: payload.standardMax,
+        isCritical: payload.isCritical,
+        updatedAt: now
+      }
+    } else {
+      const nextVersion = versions.reduce((max, version) => Math.max(max, version.version), 0) + 1
+      saved = {
+        id: createId('sv'),
+        pointId,
+        version: nextVersion,
+        standardMin: payload.standardMin,
+        standardMax: payload.standardMax,
+        isCritical: payload.isCritical,
+        effectiveDate: payload.effectiveDate,
+        createdAt: now,
+        updatedAt: now,
+        revision: ROW_REVISION
+      }
+    }
+    await db.standardVersions.put(saved)
+
+    const latest = (await db.standardVersions.where('pointId').equals(pointId).toArray()).sort(
+      (a, b) => b.version - a.version
+    )[0]
+    if (latest) {
+      await db.points.update(pointId, {
+        standardMin: latest.standardMin,
+        standardMax: latest.standardMax,
+        isCritical: latest.isCritical,
+        updatedAt: now
+      })
+    }
+    return saved
+  })
+}
+
+/** 匹配某点位在指定日期生效的标准版本（无版本记录时返回 null，由调用方回退点位现行值） */
+export async function resolveStandardVersion(pointId: string, date: string): Promise<StandardVersionRow | null> {
+  const versions = await db.standardVersions.where('pointId').equals(pointId).toArray()
+  return matchStandardVersion(versions, date)
 }
 
 /* ============================ 读数写入 ============================ */
 
-/** 写入读数：自动与标准区间比对并落 isAbnormal / deviationPct */
-export async function putReading(row: {
-  id: string
-  patrolId: string
-  pointId: string
-  value: number
-  note: string
-  createdAt: number
-  updatedAt: number
-}): Promise<ReadingRow> {
+/** 巡检的判定日期：实际巡检日期；未完成计划不提前套新标准，暂按当天 */
+export function judgeDateOfPatrol(patrol: Pick<Patrol, 'patrolDate'> | null | undefined): string {
+  return patrol && patrol.patrolDate ? patrol.patrolDate : todayText()
+}
+
+/** 写入读数：按判定日期匹配标准版本，落 isAbnormal / deviationPct / standardVersionId */
+export async function putReading(
+  row: {
+    id: string
+    patrolId: string
+    pointId: string
+    value: number
+    note: string
+    createdAt: number
+    updatedAt: number
+  },
+  judgeDate?: string
+): Promise<ReadingRow> {
   const point = await db.points.get(row.pointId)
+  const date = judgeDate || todayText()
+  const version = point ? await resolveStandardVersion(point.id, date) : null
+  const min = version ? version.standardMin : point ? point.standardMin : 0
+  const max = version ? version.standardMax : point ? point.standardMax : 0
+  const isCritical = version ? version.isCritical : point ? point.isCritical : false
   const judgement = point
-    ? judgeReading(row.value, point.standardMin, point.standardMax, point.isCritical)
+    ? judgeReading(row.value, min, max, isCritical)
     : { isAbnormal: false, deviationPct: 0 }
   const next: ReadingRow = {
     ...row,
     isAbnormal: judgement.isAbnormal,
     deviationPct: judgement.deviationPct,
+    standardVersionId: version ? version.id : '',
     revision: ROW_REVISION
   }
   await db.readings.put(next)
   return next
 }
 
-/** 重算某点位全部读数的偏差率（标准值变更后调用） */
-export async function recalculateReadingsOfPoint(pointId: string): Promise<void> {
-  const point = await db.points.get(pointId)
-  if (!point) return
-  const rows = await db.readings.where('pointId').equals(pointId).toArray()
-  if (rows.length === 0) return
-  await db.readings.bulkPut(
-    rows.map((row) => {
-      const judgement = judgeReading(row.value, point.standardMin, point.standardMax, point.isCritical)
-      return {
-        ...row,
-        isAbnormal: judgement.isAbnormal,
-        deviationPct: judgement.deviationPct,
-        updatedAt: Date.now()
-      }
-    })
-  )
+/**
+ * 按巡检实际日期复判该次巡检的全部读数。
+ * 仅在巡检完成 / 实际日期变更时调用（标准值变更不会触发历史读数重算）。
+ */
+export async function rejudgeReadingsOfPatrol(patrolId: string): Promise<number> {
+  const patrol = await db.patrols.get(patrolId)
+  if (!patrol) return 0
+  const date = judgeDateOfPatrol(patrol)
+  const rows = await db.readings.where('patrolId').equals(patrolId).toArray()
+  if (rows.length === 0) return 0
+  const pointIds = [...new Set(rows.map((row) => row.pointId))]
+  const points = await db.points.bulkGet(pointIds)
+  const pointMap = new Map(points.filter((point): point is PointRow => Boolean(point)).map((point) => [point.id, point]))
+  const versions = await db.standardVersions.where('pointId').anyOf(pointIds).toArray()
+  const now = Date.now()
+  const next = rows.map((row) => {
+    const point = pointMap.get(row.pointId)
+    if (!point) return row
+    const version = matchStandardVersion(
+      versions.filter((item) => item.pointId === row.pointId),
+      date
+    )
+    const min = version ? version.standardMin : point.standardMin
+    const max = version ? version.standardMax : point.standardMax
+    const isCritical = version ? version.isCritical : point.isCritical
+    const judgement = judgeReading(row.value, min, max, isCritical)
+    return {
+      ...row,
+      isAbnormal: judgement.isAbnormal,
+      deviationPct: judgement.deviationPct,
+      standardVersionId: version ? version.id : row.standardVersionId,
+      updatedAt: now
+    }
+  })
+  await db.readings.bulkPut(next)
+  return next.length
 }
 
 /* ============================ 整库导入导出 ============================ */
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, devices, points, patrols, readings, leaks] = await Promise.all([
+  const [stations, devices, points, patrols, readings, leaks, standardVersions] = await Promise.all([
     db.stations.count(),
     db.devices.count(),
     db.points.count(),
     db.patrols.count(),
     db.readings.count(),
-    db.leaks.count()
+    db.leaks.count(),
+    db.standardVersions.count()
   ])
-  return { stations, devices, points, patrols, readings, leaks }
+  return { stations, devices, points, patrols, readings, leaks, standardVersions }
 }
 
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [stations, devices, points, patrols, readings, leaks] = await Promise.all([
+  const [stations, devices, points, patrols, readings, leaks, standardVersions] = await Promise.all([
     db.stations.toArray(),
     db.devices.toArray(),
     db.points.toArray(),
     db.patrols.toArray(),
     db.readings.toArray(),
-    db.leaks.toArray()
+    db.leaks.toArray(),
+    db.standardVersions.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -395,14 +593,15 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     points: points.map(strip),
     patrols: patrols.map(strip),
     readings: readings.map(strip),
-    leaks: leaks.map(strip)
+    leaks: leaks.map(strip),
+    standardVersions: standardVersions.map(strip)
   }
 }
 
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.standardVersions],
       async () => {
     await Promise.all([
       db.stations.clear(),
@@ -410,22 +609,54 @@ export async function importSnapshot(payload: BackupPayload): Promise<void> {
       db.points.clear(),
       db.patrols.clear(),
       db.readings.clear(),
-      db.leaks.clear()
+      db.leaks.clear(),
+      db.standardVersions.clear()
     ])
     const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
     await db.stations.bulkPut((payload.stations ?? []).map(rev))
     await db.devices.bulkPut((payload.devices ?? []).map(rev))
     await db.points.bulkPut((payload.points ?? []).map(rev))
     await db.patrols.bulkPut((payload.patrols ?? []).map(rev))
-    await db.readings.bulkPut((payload.readings ?? []).map(rev))
+    await db.readings.bulkPut(
+      (payload.readings ?? []).map((reading) =>
+        rev({
+          ...reading,
+          standardVersionId:
+            typeof reading.standardVersionId === 'string' ? reading.standardVersionId : ''
+        })
+      )
+    )
     await db.leaks.bulkPut((payload.leaks ?? []).map(rev))
+    await db.standardVersions.bulkPut((payload.standardVersions ?? []).map(rev))
+
+    // 旧版存档没有标准版本表：为缺失版本的点位补第一版
+    const now = Date.now()
+    const versionedPointIds = new Set((payload.standardVersions ?? []).map((version) => version.pointId))
+    const missing = (payload.points ?? []).filter((point) => !versionedPointIds.has(point.id))
+    if (missing.length > 0) {
+      await db.standardVersions.bulkPut(
+        missing.map((point) =>
+          rev({
+            id: createId('sv'),
+            pointId: point.id,
+            version: 1,
+            standardMin: point.standardMin,
+            standardMax: point.standardMax,
+            isCritical: point.isCritical === true,
+            effectiveDate: dateTextOf(point.createdAt),
+            createdAt: Number.isFinite(point.createdAt) ? point.createdAt : now,
+            updatedAt: now
+          })
+        )
+      )
+    }
   })
 }
 
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.standardVersions],
       async () => {
     await Promise.all([
       db.stations.clear(),
@@ -433,7 +664,8 @@ export async function clearAllTables(): Promise<void> {
       db.points.clear(),
       db.patrols.clear(),
       db.readings.clear(),
-      db.leaks.clear()
+      db.leaks.clear(),
+      db.standardVersions.clear()
     ])
   })
 }

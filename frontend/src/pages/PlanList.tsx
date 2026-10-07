@@ -138,7 +138,8 @@ export default function PlanList() {
       stationStore.devices,
       stationStore.points,
       patrolStore.patrols,
-      readingTable.rows
+      readingTable.rows,
+      stationStore.standardVersions
     )
     Message.success(`已导出 ${filename}`)
   }

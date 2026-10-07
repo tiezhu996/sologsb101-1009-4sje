@@ -7,6 +7,8 @@ import type { Point } from '@/types/point'
 import type { Patrol } from '@/types/patrol'
 import type { Reading } from '@/types/reading'
 import type { Leak } from '@/types/leak'
+import type { StandardVersion } from '@/types/standard'
+import { versionLabel } from '@/types/standard'
 import { abnormalLevelOf, deviationPctOf, formatLeakConcentration } from '@/utils/range'
 
 export function download(filename: string, content: string, mime: string): void {
@@ -38,18 +40,21 @@ export function csvCell(value: string | number): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
 }
 
-/** 巡检读数台账 CSV */
+/** 巡检读数台账 CSV（标准区间取读数存档的判定版本） */
 export function exportReadingCsv(
   stations: Station[],
   devices: Device[],
   points: Point[],
   patrols: Patrol[],
-  readings: Reading[]
+  readings: Reading[],
+  standardVersions: StandardVersion[]
 ): string {
   const header = [
     '调压站',
     '设备',
     '点位',
+    '标准版本',
+    '生效日期',
     '标准下限',
     '标准上限',
     '单位',
@@ -69,22 +74,28 @@ export function exportReadingCsv(
     const patrol = patrols.find((item) => item.id === reading.patrolId)
     const device = point ? devices.find((item) => item.id === point.deviceId) : undefined
     const station = patrol ? stations.find((item) => item.id === patrol.stationId) : undefined
+    const version = standardVersions.find((item) => item.id === reading.standardVersionId)
+    const min = version ? version.standardMin : point ? point.standardMin : null
+    const max = version ? version.standardMax : point ? point.standardMax : null
+    const isCritical = version ? version.isCritical : point ? point.isCritical : false
     lines.push(
       [
         station ? station.name : '—',
         device ? `${device.type} ${device.model}` : '—',
         point ? point.name : '—',
-        point ? point.standardMin : '—',
-        point ? point.standardMax : '—',
+        versionLabel(version),
+        version ? version.effectiveDate : '—',
+        min ?? '—',
+        max ?? '—',
         point ? point.unit : '—',
-        point ? (point.isCritical ? '是' : '否') : '—',
+        point || version ? (isCritical ? '是' : '否') : '—',
         patrol ? patrol.planDate : '—',
         patrol ? patrol.patrolDate || '未执行' : '—',
         patrol ? patrol.patrolman || '—' : '—',
         patrol ? patrol.state : '—',
         reading.value,
         reading.deviationPct.toFixed(2),
-        point ? abnormalLevelOf(reading.deviationPct, point.isCritical) : '—',
+        point || version ? abnormalLevelOf(reading.deviationPct, isCritical) : '—',
         reading.note || '—'
       ]
         .map(csvCell)

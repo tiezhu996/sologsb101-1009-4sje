@@ -1,16 +1,27 @@
 /**
  * 巡检任务与读数状态（Zustand）
  * 维护巡检任务列表、读数草稿与异常判定结果。
+ * 读数按巡检实际日期匹配标准版本判定；未完成计划暂按当天版本，完成时按实际日期复判。
  */
 import { create } from 'zustand'
 import { liveQuery } from 'dexie'
-import { createId, db, deletePatrolCascade, putReading, type PatrolRow, type ReadingRow } from '@/utils/db'
+import {
+  createId,
+  db,
+  deletePatrolCascade,
+  judgeDateOfPatrol,
+  putReading,
+  rejudgeReadingsOfPatrol,
+  type PatrolRow,
+  type ReadingRow
+} from '@/utils/db'
 import type { Patrol, PatrolDraft, PatrolState } from '@/types/patrol'
 import type { Point } from '@/types/point'
 import type { Reading } from '@/types/reading'
 import type { ReadingDraftMap } from '@/types/reading'
+import { matchStandardVersion } from '@/types/standard'
 import type { AbnormalLevel, ReadingJudgement } from '@/utils/range'
-import { abnormalLevelOf, abnormalWeight, judgeReading } from '@/utils/range'
+import { abnormalLevelOf, abnormalWeight, judgeReading, todayText } from '@/utils/range'
 import { useStationStore } from '@/stores/stationStore'
 
 export interface AbnormalRow {
@@ -45,7 +56,10 @@ interface PatrolState_ {
   saveReadingDrafts: (patrolId: string, points: Point[]) => Promise<number>
   saveSingleReading: (patrolId: string, point: Point, value: number, note: string) => Promise<void>
   removeReading: (id: string) => Promise<void>
-  judge: (point: Point, value: number) => ReadingJudgement
+  /** 按指定日期（默认今天）生效的标准版本判定读数 */
+  judge: (point: Point, value: number, date?: string) => ReadingJudgement
+  /** 按读数存档的标准版本还原异常级别（不随标准值变更漂移） */
+  levelOfReading: (reading: Reading) => AbnormalLevel
   readingsOfPatrol: (patrolId: string) => Reading[]
   abnormalRows: () => AbnormalRow[]
   filteredPatrols: () => Patrol[]
@@ -99,6 +113,8 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
     if (patch.patrolman !== undefined) next.patrolman = patch.patrolman.trim()
     if (patch.envNote !== undefined) next.envNote = patch.envNote.trim()
     await db.patrols.update(id, next)
+    // 实际日期变更：该次巡检的读数按新日期匹配的标准版本复判
+    if (patch.patrolDate !== undefined) await rejudgeReadingsOfPatrol(id)
   },
 
   async removePatrol(id) {
@@ -139,6 +155,8 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
       envNote: envNote.trim(),
       updatedAt: Date.now()
     })
+    // 完成巡检：读数按实际巡检日期匹配的标准版本复判
+    await rejudgeReadingsOfPatrol(id)
   },
 
   setReadingDraft(patrolId, pointId, value) {
@@ -172,6 +190,9 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
   async saveReadingDrafts(patrolId, points) {
     const draft = get().readingDraft
     const existing = get().readings.filter((reading) => reading.patrolId === patrolId)
+    const patrol = get().patrols.find((item) => item.id === patrolId)
+    const judgeDate = judgeDateOfPatrol(patrol)
+    const versions = useStationStore.getState().standardVersions
     const now = Date.now()
     const payload: ReadingRow[] = []
     points.forEach((point) => {
@@ -179,7 +200,16 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
       const value = draft[key]
       if (value === undefined || !Number.isFinite(value)) return
       const found = existing.find((reading) => reading.pointId === point.id)
-      const judgement = judgeReading(value, point.standardMin, point.standardMax, point.isCritical)
+      const version = matchStandardVersion(
+        versions.filter((item) => item.pointId === point.id),
+        judgeDate
+      )
+      const judgement = judgeReading(
+        value,
+        version ? version.standardMin : point.standardMin,
+        version ? version.standardMax : point.standardMax,
+        version ? version.isCritical : point.isCritical
+      )
       payload.push({
         id: found ? found.id : createId('rd'),
         patrolId,
@@ -187,6 +217,7 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
         value,
         isAbnormal: judgement.isAbnormal,
         deviationPct: judgement.deviationPct,
+        standardVersionId: version ? version.id : '',
         note: found ? found.note : '',
         createdAt: found ? found.createdAt : now,
         updatedAt: now
@@ -199,23 +230,44 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
   async saveSingleReading(patrolId, point, value, note) {
     const now = Date.now()
     const found = get().readings.find((reading) => reading.patrolId === patrolId && reading.pointId === point.id)
-    await putReading({
-      id: found ? found.id : createId('rd'),
-      patrolId,
-      pointId: point.id,
-      value,
-      note,
-      createdAt: found ? found.createdAt : now,
-      updatedAt: now
-    })
+    const patrol = get().patrols.find((item) => item.id === patrolId)
+    await putReading(
+      {
+        id: found ? found.id : createId('rd'),
+        patrolId,
+        pointId: point.id,
+        value,
+        note,
+        createdAt: found ? found.createdAt : now,
+        updatedAt: now
+      },
+      judgeDateOfPatrol(patrol)
+    )
   },
 
   async removeReading(id) {
     await db.readings.delete(id)
   },
 
-  judge(point, value) {
-    return judgeReading(value, point.standardMin, point.standardMax, point.isCritical)
+  judge(point, value, date) {
+    const version = matchStandardVersion(
+      useStationStore.getState().standardVersions.filter((item) => item.pointId === point.id),
+      date ?? todayText()
+    )
+    return judgeReading(
+      value,
+      version ? version.standardMin : point.standardMin,
+      version ? version.standardMax : point.standardMax,
+      version ? version.isCritical : point.isCritical
+    )
+  },
+
+  levelOfReading(reading) {
+    const stationState = useStationStore.getState()
+    const version = stationState.standardVersions.find((item) => item.id === reading.standardVersionId)
+    const point = stationState.points.find((item) => item.id === reading.pointId)
+    const isCritical = version ? version.isCritical : point ? point.isCritical : false
+    return abnormalLevelOf(reading.deviationPct, isCritical)
   },
 
   readingsOfPatrol(patrolId) {
@@ -223,21 +275,24 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
   },
 
   abnormalRows() {
-    const points = useStationStore.getState().points
+    const stationState = useStationStore.getState()
+    const points = stationState.points
+    const versions = stationState.standardVersions
     return get()
       .readings.filter((reading) => reading.isAbnormal)
       .map((reading) => {
         const point = points.find((item) => item.id === reading.pointId) ?? null
         const patrol = get().patrols.find((item) => item.id === reading.patrolId) ?? null
-        const level: AbnormalLevel = point
-          ? abnormalLevelOf(reading.deviationPct, point.isCritical)
-          : '轻微超标'
+        // 级别按读数存档的标准版本还原，不随标准值变更漂移
+        const version = versions.find((item) => item.id === reading.standardVersionId) ?? null
+        const isCritical = version ? version.isCritical : point ? point.isCritical : false
+        const level: AbnormalLevel = point || version ? abnormalLevelOf(reading.deviationPct, isCritical) : '轻微超标'
         return {
           reading,
           patrol,
           point,
           level,
-          weight: point ? abnormalWeight(level, point.isCritical) : 20
+          weight: point || version ? abnormalWeight(level, isCritical) : 20
         }
       })
       .sort((a, b) => b.weight - a.weight || b.reading.deviationPct - a.reading.deviationPct)

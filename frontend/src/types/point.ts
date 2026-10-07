@@ -51,11 +51,13 @@ export const POINT_TEMPLATES: PointTemplate[] = [
   { name: '泄漏浓度', standardMin: 0, standardMax: 50, unit: 'ppm', isCritical: true }
 ]
 
-/** 点位标准值编辑草稿：点位 id → 待提交的上下限 */
+/** 点位标准值编辑草稿：点位 id → 待提交的上下限与生效日期 */
 export interface StandardDraft {
   standardMin: number
   standardMax: number
   isCritical: boolean
+  /** 生效日期 YYYY-MM-DD，提交后自该日起启用 */
+  effectiveDate: string
 }
 
 /** 点位筛选条件（存于 patrolStore 之外的组合条件） */

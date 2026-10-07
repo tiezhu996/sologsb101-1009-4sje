@@ -1,7 +1,8 @@
 /**
  * /abnormal 异常判定与分级
  * 按偏差率与关键点权重分级排序，批量确认并派发泄漏处置单。
- * 消费 Reading、Point；复用 <AbnormalTag>、<StatBadge>、<FilterBar>、<EmptyPanel>。
+ * 异常级别按读数存档的标准版本还原，标准值后续变更不影响历史判定。
+ * 消费 Reading、Point、StandardVersion；复用 <AbnormalTag>、<StatBadge>、<FilterBar>、<EmptyPanel>。
  */
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -25,6 +26,7 @@ import StatBadge from '@/components/common/StatBadge'
 import { useStationStore } from '@/stores/stationStore'
 import { usePatrolStore, type AbnormalRow } from '@/stores/patrolStore'
 import { useLeakStore } from '@/stores/leakStore'
+import { versionLabel } from '@/types/standard'
 import type { AbnormalLevel } from '@/utils/range'
 import { CRITICAL_DEVIATION_PCT, SEVERE_DEVIATION_PCT } from '@/utils/range'
 
@@ -174,10 +176,24 @@ export default function AbnormalBoard() {
       )
     },
     {
-      title: '标准区间',
-      width: 180,
-      render: (_value, record) =>
-        record.point ? `${record.point.standardMin} ~ ${record.point.standardMax} ${record.point.unit}` : '—'
+      title: '标准区间（判定版本）',
+      width: 210,
+      render: (_value, record) => {
+        if (!record.point) return '—'
+        const version = stationStore.versionById(record.reading.standardVersionId)
+        const min = version ? version.standardMin : record.point.standardMin
+        const max = version ? version.standardMax : record.point.standardMax
+        return (
+          <Space size={4}>
+            <Tag size="small" color="arcoblue">
+              {versionLabel(version)}
+            </Tag>
+            <span>
+              {min} ~ {max} {record.point.unit}
+            </span>
+          </Space>
+        )
+      }
     },
     {
       title: '读数',

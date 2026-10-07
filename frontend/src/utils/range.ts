@@ -47,6 +47,17 @@ export function daysBetween(from: string, to: string): number {
   return Math.round((end - start) / 86400000)
 }
 
+/** 今天的日期文本 YYYY-MM-DD */
+export function todayText(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+/** 时间戳 → 日期文本 YYYY-MM-DD（非法时间戳回退到今天） */
+export function dateTextOf(timestamp: number): string {
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return todayText()
+  return new Date(timestamp).toISOString().slice(0, 10)
+}
+
 /** 是否落在标准区间内 */
 export function inRange(value: number, min: number, max: number): boolean {
   return value >= min && value <= max

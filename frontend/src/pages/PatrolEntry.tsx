@@ -1,7 +1,8 @@
 /**
  * /patrols 巡检录入
- * 按计划日期逐点录入压力/温度/泄漏浓度，录入即与标准区间比对并给出异常级别。
- * 消费 Patrol、Reading、Point；复用 <AbnormalTag>、<FilterBar>、<EmptyPanel>、<StatBadge>。
+ * 按计划日期逐点录入压力/温度/泄漏浓度，录入即与生效标准版本比对并给出异常级别。
+ * 读数按巡检实际日期匹配标准版本；未完成计划暂按当天版本，完成巡检时按实际日期复判。
+ * 消费 Patrol、Reading、Point、StandardVersion；复用 <AbnormalTag>、<FilterBar>、<EmptyPanel>、<StatBadge>。
  */
 import { useEffect, useMemo, useState } from 'react'
 import {
@@ -27,6 +28,8 @@ import { usePatrolGap } from '@/hooks/usePatrolGap'
 import { PATROL_STATES, type Patrol, type PatrolState } from '@/types/patrol'
 import type { Point } from '@/types/point'
 import type { Reading } from '@/types/reading'
+import { versionLabel } from '@/types/standard'
+import { todayText } from '@/utils/range'
 
 export default function PatrolEntry() {
   const stationStore = useStationStore()
@@ -79,6 +82,9 @@ export default function PatrolEntry() {
 
   const activeReadings = activePatrol ? patrolStore.readingsOfPatrol(activePatrol.id) : []
 
+  /** 判定日期：实际巡检日期；未完成计划不提前套新标准，暂按今天 */
+  const judgeDate = activePatrol && activePatrol.patrolDate ? activePatrol.patrolDate : todayText()
+
   useEffect(() => {
     if (activePatrol) patrolStore.seedDraftFromReadings(activePatrol.id, activePoints)
     // 仅在切换巡检任务或点位集合变化时回填草稿
@@ -87,7 +93,7 @@ export default function PatrolEntry() {
   const abnormalInDraft = activePoints.filter((point) => {
     const value = activePatrol ? patrolStore.readingDraft[`${activePatrol.id}:${point.id}`] : undefined
     if (value === undefined) return false
-    return patrolStore.judge(point, value).isAbnormal
+    return patrolStore.judge(point, value, judgeDate).isAbnormal
   }).length
 
   const saveAll = async (): Promise<void> => {
@@ -151,11 +157,24 @@ export default function PatrolEntry() {
       render: (_value, record) => stationStore.points.find((point) => point.id === record.pointId)?.name ?? '点位已删除'
     },
     {
-      title: '标准区间',
-      width: 180,
+      title: '标准区间（判定版本）',
+      width: 210,
       render: (_value, record) => {
         const point = stationStore.points.find((item) => item.id === record.pointId)
-        return point ? `${point.standardMin} ~ ${point.standardMax} ${point.unit}` : '—'
+        const version = stationStore.versionById(record.standardVersionId)
+        if (!point) return '—'
+        const min = version ? version.standardMin : point.standardMin
+        const max = version ? version.standardMax : point.standardMax
+        return (
+          <Space size={4}>
+            <Tag size="small" color="arcoblue">
+              {versionLabel(version)}
+            </Tag>
+            <span>
+              {min} ~ {max} {point.unit}
+            </span>
+          </Space>
+        )
       }
     },
     { title: '读数', dataIndex: 'value', width: 120, render: (value: number) => value },
@@ -163,11 +182,7 @@ export default function PatrolEntry() {
     {
       title: '判定',
       width: 160,
-      render: (_value, record) => {
-        const point = stationStore.points.find((item) => item.id === record.pointId)
-        if (!point) return <Tag>—</Tag>
-        return <AbnormalTag level={patrolStore.judge(point, record.value).level} size="small" />
-      }
+      render: (_value, record) => <AbnormalTag level={patrolStore.levelOfReading(record)} size="small" />
     },
     { title: '备注', dataIndex: 'note', width: 200, render: (value: string) => value || '—' },
     {
@@ -301,6 +316,9 @@ export default function PatrolEntry() {
                 </h3>
                 <span className="muted">
                   草稿中异常 {abnormalInDraft} 项 / 已保存异常 {activeReadings.filter((item) => item.isAbnormal).length} 项
+                  {activePatrol.state === '已完成'
+                    ? ` · 按实际日期 ${judgeDate} 的生效版本判定`
+                    : ` · 未完成计划暂按 ${judgeDate} 版本判定，完成时按实际日期复判`}
                 </span>
               </div>
 
@@ -322,8 +340,11 @@ export default function PatrolEntry() {
                   {activePoints.map((point) => {
                     const key = `${activePatrol.id}:${point.id}`
                     const value = patrolStore.readingDraft[key]
-                    const judgement = value === undefined ? null : patrolStore.judge(point, value)
+                    const judgement = value === undefined ? null : patrolStore.judge(point, value, judgeDate)
                     const saved = activeReadings.find((item) => item.pointId === point.id)
+                    const matched = stationStore.matchVersion(point.id, judgeDate)
+                    const rangeMin = matched ? matched.standardMin : point.standardMin
+                    const rangeMax = matched ? matched.standardMax : point.standardMax
                     return (
                       <div key={point.id} className="panel" style={{ padding: 12 }}>
                         <div className="card-list-item__head">
@@ -335,8 +356,11 @@ export default function PatrolEntry() {
                         </div>
                         <div className="card-list-item__meta">
                           <span>
-                            标准 {point.standardMin} ~ {point.standardMax} {point.unit}
+                            标准 {rangeMin} ~ {rangeMax} {point.unit}
                           </span>
+                          <Tag size="small" color="arcoblue">
+                            {versionLabel(matched)}
+                          </Tag>
                           {saved ? <span>· 已存档 {saved.value}</span> : null}
                         </div>
                         <Space style={{ marginTop: 8 }}>

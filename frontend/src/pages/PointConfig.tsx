@@ -1,7 +1,8 @@
 /**
  * /points 巡检点位与标准值配置
- * 维护点位上下限、单位与关键点标记，支持模板批量复制；标准值改动先进草稿再提交。
- * 消费 Point、Device；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<AbnormalTag>。
+ * 维护点位上下限、单位与关键点标记，支持模板批量复制；标准值改动先进草稿，
+ * 提交后按生效日期生成版本（同一生效日期重复提交覆盖当次版本），历史读数判据不变。
+ * 消费 Point、Device、StandardVersion；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<AbnormalTag>。
  */
 import { useMemo, useState } from 'react'
 import {
@@ -35,8 +36,10 @@ import {
   type PointDraft,
   type PointTemplate
 } from '@/types/point'
+import type { StandardVersion } from '@/types/standard'
+import { versionLabel } from '@/types/standard'
 import { DEVICE_TYPES } from '@/types/device'
-import { abnormalLevelOf, deviationPctOf, rangeText } from '@/utils/range'
+import { abnormalLevelOf, deviationPctOf, rangeText, todayText } from '@/utils/range'
 
 export default function PointConfig() {
   const stationStore = useStationStore()
@@ -47,6 +50,7 @@ export default function PointConfig() {
   const [pointOpen, setPointOpen] = useState(false)
   const [templateOpen, setTemplateOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [historyPoint, setHistoryPoint] = useState<Point | null>(null)
   const [checkedTemplates, setCheckedTemplates] = useState<string[]>(POINT_TEMPLATES.map((item) => item.name))
 
   const filter = stationStore.pointFilter
@@ -90,9 +94,6 @@ export default function PointConfig() {
     return point.name.toLowerCase().includes(text) || (device ? device.model.toLowerCase().includes(text) : false)
   })
 
-  const abnormalCountOf = (pointId: string): number =>
-    readingTable.rows.filter((row) => row.pointId === pointId && row.isAbnormal).length
-
   const deviceOptions = stationStore.devices
     .filter((device) => !filter.stationId || device.stationId === filter.stationId)
     .map((device) => {
@@ -132,18 +133,22 @@ export default function PointConfig() {
       standardMax: Math.max(values.standardMin, values.standardMax)
     }
     if (editingId) {
-      await stationStore.updatePoint(editingId, payload)
-      Message.success('点位已更新，历史读数偏差率已重算')
+      const standardChanged = await stationStore.updatePoint(editingId, payload)
+      Message.success(
+        standardChanged
+          ? '点位已更新，标准值变更按今天生效存为新版本，历史读数判据不变'
+          : '点位已更新'
+      )
     } else {
       await stationStore.createPoint(payload)
-      Message.success('点位已创建')
+      Message.success('点位已创建，现行标准已存为第一版')
     }
     setPointOpen(false)
   }
 
   const remove = async (point: Point): Promise<void> => {
     await stationStore.removePoint(point.id)
-    Message.success('点位及其读数已删除')
+    Message.success('点位及其读数、标准版本已删除')
   }
 
   const commitAll = async (): Promise<void> => {
@@ -152,7 +157,7 @@ export default function PointConfig() {
       Message.warning('没有待提交的标准值草稿')
       return
     }
-    Message.success(`已提交 ${count} 个点位的标准值，历史读数已重算`)
+    Message.success(`已提交 ${count} 个点位的标准版本，自各自生效日期起启用，历史读数判据不变`)
   }
 
   const openTemplate = (): void => {
@@ -191,49 +196,56 @@ export default function PointConfig() {
     },
     {
       title: '标准区间（可编辑）',
-      width: 330,
+      width: 360,
       render: (_value, record) => {
         const draft = stationStore.standardDraft[record.id]
         const min = draft ? draft.standardMin : record.standardMin
         const max = draft ? draft.standardMax : record.standardMax
         const critical = draft ? draft.isCritical : record.isCritical
+        const effectiveDate = draft ? draft.effectiveDate : todayText()
+        const patchDraft = (patch: Partial<{ standardMin: number; standardMax: number; isCritical: boolean; effectiveDate: string }>): void =>
+          stationStore.setStandardDraft(record.id, {
+            standardMin: patch.standardMin ?? min,
+            standardMax: patch.standardMax ?? max,
+            isCritical: patch.isCritical ?? critical,
+            effectiveDate: patch.effectiveDate ?? effectiveDate
+          })
         return (
           <Space size={4}>
             <InputNumber
               size="small"
-              style={{ width: 92 }}
+              style={{ width: 82 }}
               value={min}
               step={0.01}
-              onChange={(value: number | undefined) =>
-                stationStore.setStandardDraft(record.id, {
-                  standardMin: Number(value ?? 0),
-                  standardMax: max,
-                  isCritical: critical
-                })
-              }
+              onChange={(value: number | undefined) => patchDraft({ standardMin: Number(value ?? 0) })}
             />
             <span>~</span>
             <InputNumber
               size="small"
-              style={{ width: 92 }}
+              style={{ width: 82 }}
               value={max}
               step={0.01}
-              onChange={(value: number | undefined) =>
-                stationStore.setStandardDraft(record.id, {
-                  standardMin: min,
-                  standardMax: Number(value ?? 0),
-                  isCritical: critical
-                })
-              }
+              onChange={(value: number | undefined) => patchDraft({ standardMax: Number(value ?? 0) })}
             />
             <span className="muted">{record.unit}</span>
+            <Input
+              size="small"
+              style={{ width: 118 }}
+              value={effectiveDate}
+              placeholder="生效日期"
+              onChange={(value: string) => patchDraft({ effectiveDate: value.trim() || todayText() })}
+            />
             <Button
               type="text"
               size="small"
               disabled={!draft}
               onClick={async () => {
-                await stationStore.commitStandardDraft(record.id)
-                Message.success(`${record.name} 标准值已保存，历史读数已重算`)
+                const saved = await stationStore.commitStandardDraft(record.id)
+                if (saved) {
+                  Message.success(
+                    `${record.name} 已存为 ${versionLabel(saved)}，自 ${saved.effectiveDate} 起生效；历史读数判据不变`
+                  )
+                }
               }}
             >
               保存
@@ -256,7 +268,8 @@ export default function PointConfig() {
               stationStore.setStandardDraft(record.id, {
                 standardMin: draft ? draft.standardMin : record.standardMin,
                 standardMax: draft ? draft.standardMax : record.standardMax,
-                isCritical: checked
+                isCritical: checked,
+                effectiveDate: draft ? draft.effectiveDate : todayText()
               })
             }
           />
@@ -264,31 +277,53 @@ export default function PointConfig() {
       }
     },
     {
-      title: '标准区间',
-      width: 160,
-      render: (_value, record) => rangeText(record.standardMin, record.standardMax, record.unit)
+      title: '当前版本',
+      width: 220,
+      render: (_value, record) => {
+        const latest = stationStore.latestVersionOf(record.id)
+        if (!latest) return <span className="muted">未建档</span>
+        const pending = latest.effectiveDate > todayText()
+        return (
+          <Space size={4}>
+            <Tag color={pending ? 'blue' : 'green'} size="small">
+              {versionLabel(latest)}
+            </Tag>
+            <span>{rangeText(latest.standardMin, latest.standardMax, record.unit)}</span>
+            <span className="muted">{pending ? `${latest.effectiveDate} 起生效` : `自 ${latest.effectiveDate}`}</span>
+          </Space>
+        )
+      }
     },
     {
       title: '异常读数',
       width: 170,
       render: (_value, record) => {
-        const count = abnormalCountOf(record.id)
-        if (count === 0) return <Tag color="green">无异常</Tag>
-        const worst = readingTable.rows
-          .filter((row) => row.pointId === record.id && row.isAbnormal)
-          .reduce((max, row) => Math.max(max, row.deviationPct), 0)
-        return <AbnormalTag level={abnormalLevelOf(worst, record.isCritical)} deviationPct={worst} size="small" />
+        const abnormal = readingTable.rows.filter((row) => row.pointId === record.id && row.isAbnormal)
+        if (abnormal.length === 0) return <Tag color="green">无异常</Tag>
+        const worst = abnormal.reduce((a, b) => (b.deviationPct > a.deviationPct ? b : a))
+        const version = stationStore.versionById(worst.standardVersionId)
+        const critical = version ? version.isCritical : record.isCritical
+        return (
+          <AbnormalTag
+            level={abnormalLevelOf(worst.deviationPct, critical)}
+            deviationPct={worst.deviationPct}
+            size="small"
+          />
+        )
       }
     },
     {
       title: '操作',
-      width: 140,
+      width: 200,
       render: (_value, record) => (
         <Space size={4}>
           <Button type="text" size="small" onClick={() => openEdit(record)}>
             编辑
           </Button>
-          <Popconfirm title="删除该点位将同时删除其巡检读数" onOk={() => remove(record)}>
+          <Button type="text" size="small" onClick={() => setHistoryPoint(record)}>
+            版本历史
+          </Button>
+          <Popconfirm title="删除该点位将同时删除其巡检读数与标准版本" onOk={() => remove(record)}>
             <Button type="text" size="small" status="danger">
               删除
             </Button>
@@ -306,7 +341,7 @@ export default function PointConfig() {
         <div>
           <h2 className="page-head__title">巡检点位与标准值配置</h2>
           <p className="page-head__desc">
-            维护点位上下限、单位与关键点标记；关键点偏差率超过 5% 即判严重超标，普通点为 10%。
+            标准值按版本与生效日期管理：改值自生效日起启用，读数按实际巡检日期匹配版本判定，历史读数判据不变。
           </p>
         </div>
         <div className="page-head__actions">
@@ -352,7 +387,7 @@ export default function PointConfig() {
           <h3 className="panel-title" style={{ margin: 0 }}>
             点位清单（{rows.length} / {stats.total}）
           </h3>
-          <span className="muted">标准值改动先进入草稿，保存后自动重算历史读数偏差率</span>
+          <span className="muted">标准值改动先进入草稿，提交时填生效日期；同一生效日期重复提交会覆盖当次版本</span>
         </div>
         {rows.length === 0 ? (
           <EmptyPanel
@@ -439,6 +474,71 @@ export default function PointConfig() {
         </Checkbox.Group>
         <div className="muted" style={{ marginTop: 10 }}>
           当前读数平均偏差参考：{deviationPctOf(0.3, 0.18, 0.25).toFixed(2)}%（示例计算）
+        </div>
+      </Modal>
+
+      <Modal
+        visible={historyPoint !== null}
+        title={historyPoint ? `标准版本历史 · ${historyPoint.name}` : '标准版本历史'}
+        onCancel={() => setHistoryPoint(null)}
+        footer={
+          <Button type="primary" onClick={() => setHistoryPoint(null)}>
+            关闭
+          </Button>
+        }
+        unmountOnExit
+        style={{ width: 720 }}
+      >
+        {historyPoint ? (
+          <Table<StandardVersion>
+            rowKey="id"
+            size="small"
+            border
+            pagination={false}
+            data={stationStore.versionsOfPoint(historyPoint.id)}
+            columns={[
+              {
+                title: '版本',
+                width: 110,
+                render: (_value, record) => {
+                  const latest = stationStore.latestVersionOf(historyPoint.id)
+                  return (
+                    <Space size={4}>
+                      <Tag color="arcoblue" size="small">
+                        {versionLabel(record)}
+                      </Tag>
+                      {latest && latest.id === record.id ? <Tag color="green" size="small">当前</Tag> : null}
+                    </Space>
+                  )
+                }
+              },
+              {
+                title: '标准区间',
+                width: 170,
+                render: (_value, record) => rangeText(record.standardMin, record.standardMax, historyPoint.unit)
+              },
+              {
+                title: '关键点',
+                width: 80,
+                render: (_value, record) => (record.isCritical ? '是' : '否')
+              },
+              { title: '生效日期', dataIndex: 'effectiveDate', width: 110 },
+              {
+                title: '读数条数',
+                width: 90,
+                render: (_value, record) =>
+                  readingTable.rows.filter((row) => row.standardVersionId === record.id).length
+              },
+              {
+                title: '提交时间',
+                width: 150,
+                render: (_value, record) => new Date(record.updatedAt).toISOString().slice(0, 16).replace('T', ' ')
+              }
+            ]}
+          />
+        ) : null}
+        <div className="muted" style={{ marginTop: 10 }}>
+          历史版本永久保留；读数按实际巡检日期匹配生效版本判定，读数条数为使用该版本判定的存档读数数量。
         </div>
       </Modal>
     </div>
